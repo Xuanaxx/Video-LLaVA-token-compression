@@ -9,7 +9,11 @@ from torch.nn import functional as F
 from transformers import PreTrainedModel, add_start_docstrings
 from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
 from transformers.models.clip.modeling_clip import CLIPMLP, CLIPAttention, CLIPTextEmbeddings, CLIPVisionEmbeddings, \
-    CLIPVisionModelWithProjection, CLIPTextModelWithProjection, _expand_mask, CLIPOutput, clip_loss
+    CLIPVisionModelWithProjection, CLIPTextModelWithProjection, CLIPOutput, clip_loss
+try:
+    from transformers.models.clip.modeling_clip import _expand_mask
+except ImportError:
+    from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask as _expand_mask
 from transformers.utils import add_start_docstrings_to_model_forward, replace_return_docstrings
 
 from .configuration_depth import LanguageBindDepthConfig, CLIPVisionConfig, CLIPTextConfig
@@ -65,6 +69,8 @@ class PatchDropout(nn.Module):
 class CLIPEncoderLayer(nn.Module):
     def __init__(self, config: LanguageBindDepthConfig):
         super().__init__()
+        if getattr(config, "_attn_implementation", None) is None:
+            config._attn_implementation = "eager"
         self.embed_dim = config.hidden_size
         self.self_attn = CLIPAttention(config)
         self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)

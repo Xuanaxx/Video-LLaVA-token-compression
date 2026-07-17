@@ -24,7 +24,18 @@ from videollava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOK
     DEFAULT_VIDEO_PATCH_TOKEN, DEFAULT_VID_START_TOKEN, DEFAULT_VID_END_TOKEN
 
 
+def _coerce_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda", **kwargs):
+    learnable_prune_lightweight_scope_finalwipe_model = _coerce_bool(
+        kwargs.pop("learnable_prune_lightweight_scope_finalwipe_model", False)
+    )
     kwargs = {"device_map": device_map, **kwargs}
 
     if device != "cuda":
@@ -104,7 +115,18 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 model = LlavaMPTForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
             else:
                 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-                model = LlavaLlamaForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
+                if learnable_prune_lightweight_scope_finalwipe_model:
+                    from videollava.model.learnable_prune_lightweight_scope_finalwipe import (
+                        LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM,
+                    )
+
+                    model = LlavaLearnablePruneLightweightScopeFinalwipeForCausalLM.from_pretrained(
+                        model_path,
+                        low_cpu_mem_usage=True,
+                        **kwargs,
+                    )
+                else:
+                    model = LlavaLlamaForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
     else:
         # Load language model
         if model_base is not None:

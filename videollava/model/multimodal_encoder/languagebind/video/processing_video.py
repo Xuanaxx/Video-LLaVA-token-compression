@@ -1,4 +1,6 @@
 
+import sys
+
 import torch
 import cv2
 import decord
@@ -6,6 +8,12 @@ import numpy as np
 from PIL import Image
 from decord import VideoReader, cpu
 from torchvision import transforms
+try:
+    import torchvision.transforms.functional_tensor  # noqa: F401
+except ImportError:
+    from torchvision.transforms import _functional_tensor
+
+    sys.modules["torchvision.transforms.functional_tensor"] = _functional_tensor
 from transformers import ProcessorMixin, BatchEncoding
 from transformers.image_processing_utils import BatchFeature
 from pytorchvideo.data.encoded_video import EncodedVideo
