@@ -125,7 +125,7 @@ class IndexedDataset(Dataset):
         if not isinstance(item, dict):
             raise TypeError("IndexedDataset expects the wrapped dataset to return dict examples.")
         item = dict(item)
-        item["_sample_id"] = source_index
+        item["_sample_id"] = int(item.pop("_resolved_sample_id", source_index))
         return item
 
 
@@ -311,9 +311,21 @@ def resolve_media_path(root: Optional[str], media_field: str) -> str:
     return os.path.join(root, media_field)
 
 
+class MediaLoadError(RuntimeError):
+    """A missing, empty, corrupt, or otherwise undecodable training medium."""
+
+    def __init__(self, media_type: str, path: str, cause: BaseException):
+        self.media_type = str(media_type)
+        self.path = str(path)
+        self.cause = cause
+        super().__init__(f"Failed to load {self.media_type} {self.path}: {cause}")
+
+
 class LazySupervisedDataset(Dataset):
     def __init__(self, tokenizer, data_path: List[str], data_args: SimpleDataArguments):
         super().__init__()
+        self.tokenizer = tokenizer
+        self.data_args = data_args
         self.list_data_dict = []
         for path in data_path:
             with open(path, "r", encoding="utf-8") as f:
@@ -322,8 +334,44 @@ class LazySupervisedDataset(Dataset):
                 record = dict(record)
                 record.setdefault("id", len(self.list_data_dict))
                 self.list_data_dict.append(record)
-        self.tokenizer = tokenizer
-        self.data_args = data_args
+        self._filter_missing_or_empty_video_records()
+        self.media_load_max_retries = max(1, int(os.environ.get("MEDIA_LOAD_MAX_RETRIES", "32")))
+        self._reported_bad_media: set[str] = set()
+
+    def _filter_missing_or_empty_video_records(self) -> None:
+        """Drop cheaply detectable bad videos before sampling/DataLoader workers."""
+        kept_records: List[Dict[str, Any]] = []
+        bad_paths: List[str] = []
+        removed_records = 0
+        for record in self.list_data_dict:
+            video_field = record.get("video")
+            if video_field is None:
+                kept_records.append(record)
+                continue
+            video_files = video_field if isinstance(video_field, list) else [video_field]
+            record_bad_paths = []
+            for video_file in video_files:
+                video_path = resolve_media_path(self.data_args.video_folder, str(video_file))
+                try:
+                    if not os.path.isfile(video_path) or os.path.getsize(video_path) <= 0:
+                        record_bad_paths.append(video_path)
+                except OSError:
+                    record_bad_paths.append(video_path)
+            if record_bad_paths:
+                removed_records += 1
+                bad_paths.extend(record_bad_paths)
+            else:
+                kept_records.append(record)
+
+        self.list_data_dict = kept_records
+        if bad_paths and int(os.environ.get("LOCAL_RANK", "0")) == 0:
+            examples = ", ".join(repr(path) for path in bad_paths[:3])
+            print(
+                f"[dataset-filter] removed_records={removed_records} "
+                f"reason=missing_or_empty_video examples=[{examples}]",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def __len__(self):
         return len(self.list_data_dict)
@@ -332,19 +380,33 @@ class LazySupervisedDataset(Dataset):
         if self.data_args.image_processor is None:
             raise ValueError("image_processor is required for image examples.")
         image_path = resolve_media_path(self.data_args.image_folder, image_file)
-        image = Image.open(image_path).convert("RGB")
-        processor = self.data_args.image_processor
-        if self.data_args.image_aspect_ratio == "pad":
-            image = _expand2square(image, tuple(int(x * 255) for x in processor.image_mean))
-        return processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
+        try:
+            if not os.path.isfile(image_path):
+                raise FileNotFoundError(image_path)
+            if os.path.getsize(image_path) <= 0:
+                raise ValueError("empty file")
+            image = Image.open(image_path).convert("RGB")
+            processor = self.data_args.image_processor
+            if self.data_args.image_aspect_ratio == "pad":
+                image = _expand2square(image, tuple(int(x * 255) for x in processor.image_mean))
+            return processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
+        except Exception as exc:
+            raise MediaLoadError("image", image_path, exc) from exc
 
     def _load_video(self, video_file: str) -> torch.Tensor:
         if self.data_args.video_processor is None:
             raise ValueError("video_processor is required for video examples.")
         video_path = resolve_media_path(self.data_args.video_folder, video_file)
-        return self.data_args.video_processor(video_path, return_tensors="pt")["pixel_values"][0]
+        try:
+            if not os.path.isfile(video_path):
+                raise FileNotFoundError(video_path)
+            if os.path.getsize(video_path) <= 0:
+                raise ValueError("empty file")
+            return self.data_args.video_processor(video_path, return_tensors="pt")["pixel_values"][0]
+        except Exception as exc:
+            raise MediaLoadError("video", video_path, exc) from exc
 
-    def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+    def _get_item(self, i: int) -> Dict[str, torch.Tensor]:
         sources = self.list_data_dict[i]
         if isinstance(i, int):
             sources = [sources]
@@ -370,6 +432,43 @@ class LazySupervisedDataset(Dataset):
             data_dict = dict(input_ids=data_dict["input_ids"][0], labels=data_dict["labels"][0])
         data_dict["image"] = media
         return data_dict
+
+    def _report_bad_media(self, requested_index: int, failed_index: int, exc: MediaLoadError) -> None:
+        if exc.path in self._reported_bad_media:
+            return
+        self._reported_bad_media.add(exc.path)
+        worker = torch.utils.data.get_worker_info()
+        worker_id = worker.id if worker is not None else "main"
+        print(
+            "[media-skip] "
+            f"worker={worker_id} requested_sample={requested_index} failed_sample={failed_index} "
+            f"type={exc.media_type} path={exc.path!r} reason={exc.cause}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+        requested_index = int(i)
+        failures: List[MediaLoadError] = []
+        max_attempts = min(self.media_load_max_retries, len(self.list_data_dict))
+        for offset in range(max_attempts):
+            candidate_index = (requested_index + offset) % len(self.list_data_dict)
+            try:
+                item = self._get_item(candidate_index)
+                item["_resolved_sample_id"] = candidate_index
+                return item
+            except MediaLoadError as exc:
+                failures.append(exc)
+                self._report_bad_media(requested_index, candidate_index, exc)
+
+        failure_summary = "; ".join(
+            f"sample={((requested_index + offset) % len(self.list_data_dict))} path={exc.path!r}: {exc.cause}"
+            for offset, exc in enumerate(failures)
+        )
+        raise RuntimeError(
+            f"Unable to find a decodable sample after {max_attempts} attempts "
+            f"starting at dataset index {requested_index}. Failures: {failure_summary}"
+        ) from failures[-1]
 
 
 class DataCollatorForSupervisedDataset:
@@ -1791,12 +1890,16 @@ def main() -> None:
     config.mm_projector_type = args.mm_projector_type
     config.mm_vision_select_layer = args.mm_vision_select_layer
     config.mm_vision_select_feature = args.mm_vision_select_feature
+    # The official Video-LLaVA checkpoint already bundles both vision towers.
+    # Construct their module skeletons before from_pretrained loads the parent
+    # state dict so those weights are consumed instead of discarded as unused.
+    config.load_mm_towers_from_main_checkpoint = True
 
     llava = LlavaLlamaForCausalLM.from_pretrained(
         args.model_name_or_path,
         config=config,
         low_cpu_mem_usage=True,
-        torch_dtype=dtype,
+        dtype=dtype,
     )
     vision_init_args = argparse.Namespace(
         image_tower=getattr(config, "mm_image_tower", None),

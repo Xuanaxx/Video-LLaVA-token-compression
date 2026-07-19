@@ -1,5 +1,7 @@
 
+import os
 import sys
+import warnings
 
 import torch
 import cv2
@@ -16,12 +18,43 @@ except ImportError:
     sys.modules["torchvision.transforms.functional_tensor"] = _functional_tensor
 from transformers import ProcessorMixin, BatchEncoding
 from transformers.image_processing_utils import BatchFeature
-from pytorchvideo.data.encoded_video import EncodedVideo
 from torchvision.transforms import Compose, Lambda, ToTensor
-from torchvision.transforms._transforms_video import NormalizeVideo, RandomCropVideo, RandomHorizontalFlipVideo, CenterCropVideo
-from pytorchvideo.transforms import ApplyTransformToKey, ShortSideScale, UniformTemporalSubsample
+with warnings.catch_warnings():
+    # torchvision keeps these video transforms for compatibility but warns on
+    # import. pytorchvideo still depends on the same API; contain that upstream
+    # deprecation here rather than printing it once per distributed worker.
+    warnings.filterwarnings(
+        "ignore",
+        message=r"The 'torchvision\.transforms\._(?:functional|transforms)_video' module is deprecated.*",
+        category=UserWarning,
+    )
+    from pytorchvideo.data.encoded_video import EncodedVideo
+    from torchvision.transforms._transforms_video import NormalizeVideo, RandomCropVideo, RandomHorizontalFlipVideo, CenterCropVideo
+    from pytorchvideo.transforms import ApplyTransformToKey, ShortSideScale, UniformTemporalSubsample
 
 decord.bridge.set_bridge('torch')
+
+# FFmpeg classifies recoverable H.264 reference-frame issues such as
+# ``mmco: unref short failure`` as ERROR even when Decord successfully returns
+# all requested frames.  Keep native stderr for fatal decoder failures only;
+# the training dataset performs its own validation/retry and emits a structured
+# ``[media-skip]`` message whenever decoding actually fails.
+_DECORD_LOG_LEVELS = {
+    "quiet": decord.logging.QUIET,
+    "panic": decord.logging.PANIC,
+    "fatal": decord.logging.FATAL,
+    "error": decord.logging.ERROR,
+    "warning": decord.logging.WARNING,
+    "info": decord.logging.INFO,
+    "debug": decord.logging.DEBUG,
+}
+_decord_log_level_name = os.environ.get("DECORD_LOG_LEVEL", "fatal").strip().lower()
+if _decord_log_level_name not in _DECORD_LOG_LEVELS:
+    raise ValueError(
+        f"Unsupported DECORD_LOG_LEVEL={_decord_log_level_name!r}; "
+        f"choose one of {sorted(_DECORD_LOG_LEVELS)}"
+    )
+decord.logging.set_level(_DECORD_LOG_LEVELS[_decord_log_level_name])
 
 OPENAI_DATASET_MEAN = (0.48145466, 0.4578275, 0.40821073)
 OPENAI_DATASET_STD = (0.26862954, 0.26130258, 0.27577711)

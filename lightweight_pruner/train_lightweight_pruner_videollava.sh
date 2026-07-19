@@ -13,8 +13,13 @@ else
 fi
 cd /data1/chenzixuan/open_source_projects/Video-LLaVA-token-compression
 
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-6,7}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
 export HF_ENDPOINT=${VIDEOLLAVA_HF_ENDPOINT:-"https://huggingface.co"}
+# LanguageBind tower metadata/processors are already cached under the repository's
+# ./cache_dir. Avoid failing Hub HEAD requests from every distributed worker.
+# Override both variables with 0 when an online cache refresh is intentional.
+export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
+export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_ALLOC_CONF=${PYTORCH_ALLOC_CONF:-"expandable_segments:True"}
 export WANDB_PROJECT=${WANDB_PROJECT:-"videollava_learnable_prune_lightweight_fixed_layer"}
@@ -64,7 +69,7 @@ PREDICTOR_NUM_HEADS=${PREDICTOR_NUM_HEADS:-4}
 PREDICTOR_RANK_MLP_RATIO=${PREDICTOR_RANK_MLP_RATIO:-2}
 PREDICTOR_USE_VISUAL_POSITION=${PREDICTOR_USE_VISUAL_POSITION:-true}
 PREDICTOR_USE_TEXT_POSITION=${PREDICTOR_USE_TEXT_POSITION:-true}
-PREDICTOR_KEEP_K=${PREDICTOR_KEEP_K:-64}
+PREDICTOR_KEEP_K=${PREDICTOR_KEEP_K:-228}
 
 EXTRA_ARGS=()
 if [[ -n "${MAX_SAMPLES}" ]]; then
@@ -114,7 +119,12 @@ if [[ "$DATA_PATHS" == *"videochatgpt_tune_.json"* && ! -d "$VIDEO_FOLDER/videoc
   exit 2
 fi
 
-ACCELERATE_ARGS=(--num_processes "$NUM_GPUS")
+ACCELERATE_ARGS=(
+  --num_processes "$NUM_GPUS"
+  --num_machines 1
+  --mixed_precision no
+  --dynamo_backend no
+)
 if (( NUM_GPUS > 1 )); then
   ACCELERATE_ARGS=(--multi_gpu "${ACCELERATE_ARGS[@]}")
 fi

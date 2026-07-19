@@ -103,13 +103,29 @@ class LanguageBindImageTower(nn.Module):
 
         self.cache_dir = cache_dir
 
-        if not delay_load:
+        load_from_parent = bool(getattr(args, "load_mm_towers_from_main_checkpoint", False))
+        if delay_load and load_from_parent:
+            # Build the tower module before the parent Video-LLaVA checkpoint is
+            # loaded. This lets Transformers consume the bundled
+            # model.image_tower.image_tower.* tensors instead of reporting all
+            # of them as unused and then loading a duplicate external checkpoint.
+            self.cfg_only = LanguageBindImageConfig.from_pretrained(
+                self.image_tower_name, cache_dir=self.cache_dir
+            )
+            model = LanguageBindImage(self.cfg_only)
+            self.image_tower = model.vision_model
+            self.image_tower.requires_grad_(False)
+            self.image_processor = LanguageBindImageProcessor(model.config)
+            self.is_loaded = True
+        elif not delay_load:
             self.load_model()
         else:
             self.cfg_only = LanguageBindImageConfig.from_pretrained(self.image_tower_name, cache_dir=self.cache_dir)
 
     ############################################################
     def load_model(self):
+        if self.is_loaded:
+            return
         model = LanguageBindImage.from_pretrained(self.image_tower_name, cache_dir=self.cache_dir)
         self.image_tower = model.vision_model
         self.image_tower.requires_grad_(False)
@@ -185,13 +201,27 @@ class LanguageBindVideoTower(nn.Module):
 
         self.cache_dir = cache_dir
 
-        if not delay_load:
+        load_from_parent = bool(getattr(args, "load_mm_towers_from_main_checkpoint", False))
+        if delay_load and load_from_parent:
+            # See LanguageBindImageTower above. The parent checkpoint contains
+            # model.video_tower.video_tower.* and should be its source of truth.
+            self.cfg_only = LanguageBindVideoConfig.from_pretrained(
+                self.video_tower_name, cache_dir=self.cache_dir
+            )
+            model = LanguageBindVideo(self.cfg_only)
+            self.video_processor = LanguageBindVideoProcessor(model.config)
+            self.video_tower = model.vision_model
+            self.video_tower.requires_grad_(False)
+            self.is_loaded = True
+        elif not delay_load:
             self.load_model()
         else:
             self.cfg_only = LanguageBindVideoConfig.from_pretrained(self.video_tower_name, cache_dir=self.cache_dir)
 
     ############################################################
     def load_model(self):
+        if self.is_loaded:
+            return
         model = LanguageBindVideo.from_pretrained(self.video_tower_name, cache_dir=self.cache_dir)
         self.video_processor = LanguageBindVideoProcessor(model.config)
 
@@ -256,5 +286,4 @@ class LanguageBindVideoTower(nn.Module):
     @property
     def num_patches(self):
         return (self.config.image_size // self.config.patch_size) ** 2
-
 
